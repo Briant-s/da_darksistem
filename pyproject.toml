@@ -1,0 +1,17 @@
+[project]
+name = "prelimenary"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "imbalanced-learn>=0.14.2",
+    "iterative-stratification>=0.1.9",
+    "pandas>=3.0.3",
+    "scikit-learn>=1.9.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+]
