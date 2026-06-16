@@ -1,0 +1,900 @@
+Total cells: 59
+
+=== Cell 0 (code) ===
+# Import Libraries
+import pandas as pd
+import numpy as np
+
+=== Cell 1 (code) ===
+src = 'clean.csv'
+df = pd.read_csv(src, sep=',', encoding='utf-8')
+
+=== Cell 2 (markdown) ===
+# **Data Description**
+
+=== Cell 3 (code) ===
+df.info(verbose=True, show_counts=True)
+
+=== Cell 4 (code) ===
+df.head()
+
+=== Cell 5 (code) ===
+missing = pd.DataFrame({
+    "Missing Values": df.isnull().sum(),
+    "Percentage": df.isnull().sum() / len(df)
+})
+
+print(missing[missing["Missing Values"] > 0].to_string())
+
+=== Cell 6 (markdown) ===
+# **Data Cleansing**
+
+=== Cell 7 (code) ===
+df_temp = df.copy()
+
+=== Cell 8 (code) ===
+target_cols = ['Malaria', 'Diagnosed Dengue', 'Yellow fever', 
+               'Typhoid fever', 'Other diagnosed diseases']
+
+num_issues = ['Hematocrit', 'White blood cell count', 'Platelet count', 'Neutrophils', 'Age']
+
+redudant_cols = [
+    'UUID', 'Diagnosed diseases', 'Other diseases presented by patient',
+    'Diagnosed Chikungunya', 'Diagnosed Zika', 'Diagnosed Option 8',
+    'Mua circumference', 'Capillary refill time', 'Arterial blood pressure',
+    'Lymphocytes', 'Health Center', 'Conjunctivitis', 'Facial flushing', 'Profuse sweating',
+    'Rheumatic disease', 'Autoimmune disease', 'Allergies', 'Cancer', 'Leucopenia', 
+]
+
+
+disease_to_target = {
+    'Malaria':  'Malaria',
+    'Dengue':   'Diagnosed Dengue',
+    'Yellow':   'Yellow fever',
+    'Typhoid':  'Typhoid fever',
+}
+
+=== Cell 9 (code) ===
+# 1. Fixing Formatting Issues
+for col in num_issues:
+    df_temp[col] = df_temp[col].astype(str).str.replace(',', '.', regex=False)
+    df_temp[col] = pd.to_numeric(df_temp[col], errors='coerce')
+    
+def clean_pulse(val):
+    if pd.isna(val): return np.nan
+    if '/' in str(val) or '|' in str(val): return np.nan
+    try: return float(val)
+    except: return np.nan
+
+df_temp['Pulse rate'] = df_temp['Pulse rate'].apply(clean_pulse)
+
+=== Cell 10 (code) ===
+# 2. Parsing Diagnosed Diseasies to backfill targets
+def parse_diagnosed_diseases(text):
+    if pd.isna(text) or str(text).strip() == '':
+        return {col: np.nan for col in target_cols}
+    return {
+        'Malaria':                  1 if 'Paludisme' in text or 'Malaria' in text else 0,
+        'Diagnosed Dengue':         1 if 'Dengue' in text else 0,
+        'Yellow fever':             1 if 'jaune' in text or 'yellow' in text.lower() else 0,
+        'Typhoid fever':            1 if 'Typho' in text else 0,
+        'Other diagnosed diseases': 1 if 'Autres' in text or 'Others' in text else 0
+    }
+
+parsed = pd.DataFrame(
+    df_temp['Diagnosed diseases'].apply(parse_diagnosed_diseases).to_list(),
+    index=df_temp.index
+)
+
+for col in target_cols:
+    mask = df_temp[col].isna()
+    df_temp.loc[mask, col] = parsed.loc[mask, col]
+
+
+=== Cell 11 (code) ===
+# 3. Drop Blank-Diagnosis Rows
+blank_mask = (
+    df_temp['Diagnosed diseases'].isna() | 
+    (df_temp['Diagnosed diseases'].str.strip() == '')
+)
+print(f"Dropping {blank_mask.sum()} rows with no diagnosis")
+df_temp = df_temp[~blank_mask].reset_index(drop=True)
+
+# Any targets still NaN after backfill → assume 0
+for col in target_cols:
+    df_temp[col] = df_temp[col].fillna(0)
+
+=== Cell 12 (code) ===
+# 4. Droping Redundant Columns
+df_temp.drop(columns=redudant_cols, inplace=True)
+
+=== Cell 13 (code) ===
+# 5. Categorical Encoding
+binary_cols = [col for col in df_temp.columns if df_temp[col].dropna().isin(['YES', 'NO']).all()]
+
+for col in binary_cols:
+    df_temp[col] = df_temp[col].map({'YES': 1, 'NO':0})
+    
+df_temp['Gender']           = df_temp['Gender'].map({'Male': 1, 'Female': 0})
+df_temp['Type of fever']    = df_temp['Type of fever'].map({'Recurrent': 1, 'Intermittent': 0})
+df_temp['RDT Test']         = df_temp['RDT Test'].map({'Positive': 1, 'Negative': 0})
+df_temp['Thick blood smear']= df_temp['Thick blood smear'].map({'Positive': 1, 'Negative': 0})
+
+
+=== Cell 14 (code) ===
+def clean_temperature(val):
+    if pd.isna(val): return np.nan
+    val = str(val).strip().replace('T', '').replace(',', '.')
+    try:
+        temp = float(val)
+        # Fix missing decimal point — all valid temps are 35-42
+        # so any 4-digit integer like 3809 → 38.09, 3501 → 35.01
+        if temp >= 3500:
+            temp = temp / 100
+        # Fix 3-digit integers like 390 → 39.0, 367 → 36.7
+        elif temp >= 350:
+            temp = temp / 10
+        # Valid range check
+        if 35.0 <= temp <= 42.5:
+            return temp
+        return np.nan
+    except:
+        return np.nan
+
+df_temp['Axillary temperature'] = df_temp['Axillary temperature'].apply(clean_temperature)
+
+# Verify
+print(df_temp['Axillary temperature'].describe())
+print(f"NaN count: {df['Axillary temperature'].isna().sum()}")
+
+=== Cell 15 (code) ===
+def combine_tests(rdt, smear):
+    """
+    rdt, smear : individual values from RDT Test / Thick blood smear columns (0, 1, or NaN)
+    Returns a single composite score representing test agreement/confidence
+    """
+    if pd.isna(rdt) or pd.isna(smear):
+        return np.nan
+    if rdt == 1 and smear == 1:
+        return 2   # both positive — high confidence Malaria
+    elif rdt == 1 or smear == 1:
+        return 1   # only one positive — discordant, moderate confidence
+    else:
+        return 0   # both negative — low confidence, but NOT ruled out (NPV ~40%
+
+=== Cell 16 (code) ===
+# Apply row-by-row using .apply with axis=1
+df_temp['Malaria_test_composite'] = df_temp.apply(
+    lambda r: combine_tests(r['RDT Test'], r['Thick blood smear']),
+    axis=1
+)
+
+# Check the result
+print(df_temp['Malaria_test_composite'].value_counts(dropna=False))
+print(df_temp[['RDT Test', 'Thick blood smear', 'Malaria_test_composite']].head(10))
+
+=== Cell 17 (code) ===
+# Save Checkpoint
+df_clean = df_temp.copy()
+df_clean.to_csv('clean_base.csv', index=False)
+print(f"Base cleaning done. Shape: {df_clean.shape}")
+
+=== Cell 18 (markdown) ===
+# **Data Prepping**
+
+=== Cell 19 (code) ===
+def make_label(row):
+    labels = []
+    if row['Malaria'] == 1:                  labels.append('Malaria')
+    if row['Diagnosed Dengue'] == 1:         labels.append('Dengue')
+    if row['Yellow fever'] == 1:             labels.append('Yellow Fever')
+    if row['Typhoid fever'] == 1:            labels.append('Typhoid')
+    if row['Other diagnosed diseases'] == 1: labels.append('Other')
+    return ' + '.join(labels) if labels else 'Unknown'
+
+=== Cell 20 (code) ===
+symptom_groups = {
+    'hemorrhagic_score': ['Bleeding', 'Epistaxis (Bleeding nose)',
+                          'Positive tourniquet test', 'Hemoglobinuria'],
+    'neuro_score':       ['Consciousness trouble', 'Delirium', 'Irrational talking',
+                          'Generalised or focal convulsion', 'Multiple convulsions',
+                          'Impaired level of consciousness', 'Drowsiness or lethargy'],
+    'gi_score':          ['Nausea', 'Vomiting', 'Diarrhea', 'Abdominal pain',
+                          'Abdominal distension', 'Loss of appetite or Anorexia'],
+    'musculo_score':     ['Muscle pain', 'Joint pain', 'Joint Swelling',
+                          'Rachiodynia', 'Stiffness'],
+    'systemic_score':    ['Fever 48 hrs', 'Fever in the last 7 days',
+                          'Shiver or cold sensation', 'Prostration'],
+    'respiratory_score': ['Cough', 'Respiratory distress', 'Rhinorrhea',
+                          'Chest pain', 'Throat pain'],
+    'severity_score':    ['Shock', 'Myocarditis', 'Septicemia',
+                          'Accumulation of fluid and respiratory distress',
+                          'Hepatosplenomegaly'],
+}
+
+
+=== Cell 21 (code) ===
+def impute_by_group(df, group_col, group_medians, global_medians, cols):
+    df = df.copy()
+    for group, group_df in df.groupby(group_col):
+        for col in cols:
+            if df.loc[group_df.index, col].isna().any():
+                # Use group median if available, else global
+                fill_val = (
+                    group_medians.loc[group, col]
+                    if group in group_medians.index
+                    else global_medians[col]
+                )
+                df.loc[group_df.index, col] = (
+                    df.loc[group_df.index, col].fillna(fill_val)
+                )
+    return df
+
+=== Cell 22 (markdown) ===
+# **Analytic**
+
+=== Cell 23 (code) ===
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import seaborn as sns
+
+=== Cell 24 (code) ===
+CONTINUOUS_COLS = ['Age', 'Weight', 'Axillary temperature', 'Respiratory rate',
+                    'Pulse rate', 'Hematocrit', 'White blood cell count',
+                    'Platelet count', 'Neutrophils', 'Elevated Creatinine']
+
+LABEL_COLS = ['Malaria', 'Diagnosed Dengue', 'Yellow fever',
+              'Typhoid fever', 'Other diagnosed diseases']
+
+=== Cell 25 (code) ===
+df.describe().T
+
+=== Cell 26 (code) ===
+fig, axes = plt.subplots(len(CONTINUOUS_COLS), 2, figsize=(14, 4.5 * len(CONTINUOUS_COLS)))
+
+for i, col in enumerate(CONTINUOUS_COLS):
+    data = df[col].dropna()
+
+    sns.histplot(data, kde=True, ax=axes[i, 0], color='steelblue')
+    axes[i, 0].set_title(f'{col} — Distribution', fontsize=11)
+    # axes[i, 0].xaxis.set_major_locator(ticker.MaxNLocator(nbins=6))  # ← caps tick count
+    axes[i, 0].tick_params(axis='x', labelsize=9)
+
+    sns.boxplot(x=data, ax=axes[i, 1], color='lightcoral')
+    axes[i, 1].set_title(f'{col} — Box Plot', fontsize=11)
+    # axes[i, 1].xaxis.set_major_locator(ticker.MaxNLocator(nbins=6))  # ← caps tick count
+    axes[i, 1].tick_params(axis='x', labelsize=9)
+
+plt.tight_layout(pad=2.0, h_pad=3.0)
+plt.savefig('continuous_columns.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+=== Cell 27 (code) ===
+label_counts = df[LABEL_COLS].sum().sort_values(ascending=False)
+
+plt.figure(figsize=(9, 5))
+ax = sns.barplot(x=label_counts.values, y=label_counts.index, palette='viridis', hue=label_counts.index, legend=False)
+ax.set_title('Disease Label Distribution (Positive Cases)', fontsize=12)
+ax.set_xlabel('Count', fontsize=10)
+ax.set_ylabel('')
+ax.tick_params(axis='y', labelsize=9)
+
+for i, v in enumerate(label_counts.values):
+    ax.text(v + 1, i, str(int(v)), va='center', fontsize=9)
+
+plt.tight_layout()
+plt.savefig('label_distribution.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+
+=== Cell 28 (code) ===
+categorical = [
+    "Gender" ,"Type of fever", "Health Center", "Fever 48 hrs", "Fever in the last 7 days"
+]
+
+excluded = ['Gender', 'Age', 'Weight', 'Temperature', 'Type of fever',
+           'Axillary temperature', 'Respiratory rate', 'Pulse rate',
+           'Hematocrit', 'White blood cell count', 'Platelet count',
+           'Neutrophils', 'Elevated Creatinine',
+           'Malaria', 'Diagnosed Dengue', 'Yellow fever',
+           'Typhoid fever', 'Other diagnosed diseases', 'Mua circumference']
+
+symptom_cols = [c for c in df.columns if c not in excluded]
+
+=== Cell 29 (code) ===
+def categorical_distribution(data, catCols):
+    slots = len(categorical)
+    rows = -(-slots//3)
+    plt.figure(figsize=(15, rows * 3))
+    for i, col in enumerate(catCols, 1):
+        plt.subplot(rows, 3, i)
+        counts = data[col].value_counts()
+        plt.bar(counts.index, counts.values)
+        plt.title(col)
+    plt.tight_layout()
+    plt.show()
+
+categorical_distribution(df, categorical)
+
+=== Cell 30 (code) ===
+def positive_count(series):
+    clean_series = series.astype(str).str.strip().str.lower()
+    return clean_series.isin(['yes', '1', 'true']).sum()
+
+symptom_counts = pd.Series(
+    {col: positive_count(df[col]) for col in symptom_cols}
+).sort_values(ascending=False)
+
+top10 = symptom_counts.head(10)
+
+plt.figure(figsize=(9, 6))
+plt.barh(top10.index[::-1], top10.values[::-1], color='steelblue')
+plt.title('Top 10 Most Common Symptoms (YES count)', fontsize=12)
+plt.xlabel('Count')
+plt.tight_layout()
+plt.show()
+
+=== Cell 31 (markdown) ===
+# **Statistical Analysis**
+
+=== Cell 32 (code) ===
+from scipy import stats
+from statsmodels.stats.multitest import multipletests
+from statsmodels.stats.proportion import proportion_confint
+from sklearn.metrics import confusion_matrix, matthews_corrcoef
+
+=== Cell 33 (code) ===
+df_viz = df_clean.copy()
+
+=== Cell 34 (code) ===
+MIN_N = 15          
+FDR_ALPHA = 0.05
+TARGETS = ["Malaria", "Diagnosed Dengue", "Yellow fever", "Typhoid fever", "Other diagnosed diseases"]
+LEAKAGE_MAP = {"Diagnosed Dengue": ["Dengue"]}
+
+=== Cell 35 (code) ===
+def is_binary(series: pd.Series) -> bool:
+    vals = set(series.dropna().unique())
+    return vals <= {0, 0.0, 1, 1.0}
+
+def run_correlation_analysis(df: pd.DataFrame) -> pd.DataFrame:
+    results = []
+    for target in TARGETS:
+        excl = set(TARGETS) | set(LEAKAGE_MAP.get(target, []))
+        predictors = [c for c in df.columns if c not in excl]
+
+        for col in predictors:
+            sub = df[[col, target]].dropna()
+            if len(sub) < MIN_N: continue
+            y = sub[target].astype(int)
+            if y.nunique() < 2: continue
+
+            if is_binary(df[col]):
+                x = sub[col].astype(int)
+                ct = pd.crosstab(x, y)
+                if ct.shape != (2, 2): continue
+                n = ct.values.sum()
+                chi2, p_chi, _, expected = stats.chi2_contingency(ct, correction=False)
+                
+                if (expected < 5).any():
+                    _, p = stats.fisher_exact(ct)
+                    method = "Fisher exact"
+                else:
+                    p, method = p_chi, "Chi-square"
+                    
+                # Using sklearn for Phi coefficient
+                phi = matthews_corrcoef(y, x) 
+                results.append(dict(target=target, predictor=col, var_type="binary",
+                                     n=int(n), corr=phi, stat_method=method, p_value=p))
+            else:
+                x = pd.to_numeric(sub[col], errors="coerce")
+                sub2 = pd.DataFrame({"x": x, "y": y}).dropna()
+                if sub2["y"].nunique() < 2 or len(sub2) < MIN_N: continue
+                g1, g0 = sub2.loc[sub2.y == 1, "x"], sub2.loc[sub2.y == 0, "x"]
+                if g1.nunique() < 1 or g0.nunique() < 1: continue
+                try:
+                    r, _ = stats.pointbiserialr(sub2["y"], sub2["x"])
+                    _, p = stats.mannwhitneyu(g1, g0, alternative="two-sided")
+                except ValueError:
+                    continue
+                results.append(dict(target=target, predictor=col, var_type="continuous",
+                                     n=len(sub2), corr=r, stat_method="Mann-Whitney U", p_value=p))
+
+    res_df = pd.DataFrame(results)
+    res_df["q_value"] = np.nan
+    
+    # Using statsmodels for Benjamini-Hochberg FDR correction
+    for target in TARGETS:
+        mask = res_df["target"] == target
+        if mask.any():
+            _, q_vals, _, _ = multipletests(res_df.loc[mask, "p_value"], alpha=FDR_ALPHA, method='fdr_bh')
+            res_df.loc[mask, "q_value"] = q_vals
+            
+    res_df["significant_q05"] = res_df["q_value"] < FDR_ALPHA
+    return res_df.sort_values(["target", "q_value"]).reset_index(drop=True)
+correlation_results = run_correlation_analysis(df_viz)
+
+=== Cell 36 (code) ===
+correlation_results
+
+=== Cell 37 (code) ===
+def get_ci(count, nobs):
+    """Helper to cleanly wrap the statsmodels Wilson CI"""
+    if nobs == 0: return (np.nan, np.nan)
+    lo, hi = proportion_confint(count, nobs, alpha=0.05, method='wilson')
+    return (max(0, lo), min(1, hi))
+
+def diagnostic_accuracy(df: pd.DataFrame, test_col: str, ref_col: str = "Malaria") -> dict:
+    sub = df[[test_col, ref_col]].dropna().astype(int)
+    
+    # Using sklearn to instantly unpack the confusion matrix
+    tn, fp, fn, tp = confusion_matrix(sub[ref_col], sub[test_col]).ravel()
+    n = tp + fp + fn + tn
+
+    sens = tp / (tp + fn) if (tp + fn) else np.nan
+    spec = tn / (tn + fp) if (tn + fp) else np.nan
+    ppv = tp / (tp + fp) if (tp + fp) else np.nan
+    npv = tn / (tn + fn) if (tn + fn) else np.nan
+    acc = (tp + tn) / n
+    plr = sens / (1 - spec) if spec < 1 else np.inf
+    nlr = (1 - sens) / spec if spec > 0 else np.inf
+
+    return dict(test=test_col, reference=ref_col, n=n, TP=tp, FP=fp, FN=fn, TN=tn,
+                sensitivity=sens, sens_ci=get_ci(tp, tp + fn),
+                specificity=spec, spec_ci=get_ci(tn, tn + fp),
+                ppv=ppv, ppv_ci=get_ci(tp, tp + fp),
+                npv=npv, npv_ci=get_ci(tn, tn + fn),
+                accuracy=acc, acc_ci=get_ci(tp + tn, n),
+                lr_positive=plr, lr_negative=nlr)
+
+def print_diagnostic_report(metrics: dict):
+    t, r = metrics["test"], metrics["reference"]
+    print(f"--- {t} vs {r} ---")
+    print(f"n analyzed = {metrics['n']}")
+    for label, key, ci_key in [("Sensitivity", "sensitivity", "sens_ci"),
+                                ("Specificity", "specificity", "spec_ci"),
+                                ("PPV", "ppv", "ppv_ci"),
+                                ("NPV", "npv", "npv_ci"),
+                                ("Accuracy", "accuracy", "acc_ci")]:
+        lo, hi = metrics[ci_key]
+        print(f"{label:12s}: {metrics[key]*100:5.1f}%  (95% CI {lo*100:4.1f}-{hi*100:4.1f}%)")
+    print("\n")
+
+rdt = diagnostic_accuracy(df_viz, "RDT Test", "Malaria")
+smear = diagnostic_accuracy(df_viz, "Thick blood smear", "Malaria")
+print_diagnostic_report(rdt)
+print_diagnostic_report(smear)
+
+=== Cell 38 (markdown) ===
+# **Modelling**
+
+=== Cell 39 (code) ===
+from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer, KNNImputer
+from sklearn.preprocessing import RobustScaler
+from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
+from imblearn.over_sampling import SMOTE
+from sklearn.ensemble import RandomForestClassifier
+
+=== Cell 40 (code) ===
+df_prep = df_clean.copy()
+
+=== Cell 41 (code) ===
+def compute_sens_spec(test_col, true_label_col):
+    """
+    test_col       : pd.Series, the diagnostic test (e.g. RDT Test), 0/1
+    true_label_col : pd.Series, the true disease label (e.g. Malaria), 0/1
+    Returns sensitivity, specificity
+    """
+    # Drop rows where either is missing
+    mask = test_col.notna() & true_label_col.notna()
+    y_true = true_label_col[mask]
+    y_pred = test_col[mask]
+
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+
+    sensitivity = tp / (tp + fn)  # a.k.a. recall
+    specificity = tn / (tn + fp)
+
+    return sensitivity, specificity
+
+=== Cell 42 (code) ===
+# 1. Seperating X & Y
+y = df_prep[target_cols].copy()
+X = df_prep.drop(columns=target_cols)
+
+=== Cell 43 (code) ===
+# 2. Multi-label stratified splitting
+msss = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=0.15, random_state=42)
+for train_idx, test_idx in msss.split(X, y):
+    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+msss_val = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=0.15, random_state=42)
+for train_idx, val_idx in msss_val.split(X_train, y_train):
+    X_val   = X_train.iloc[val_idx]
+    y_val   = y_train.iloc[val_idx]
+    X_train = X_train.iloc[train_idx]
+    y_train = y_train.iloc[train_idx]
+
+
+print(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+
+=== Cell 44 (code) ===
+# 3. Diseased-informed binary imputation
+train_combined = X_train.copy()
+train_combined['_disease_group'] = (
+    y_train[target_cols].apply(make_label, axis=1)
+)
+
+group_medians = (
+    train_combined.groupby('_disease_group')[binary_cols].median()
+)
+global_medians = X_train[binary_cols].median()
+
+X_train = impute_by_group(
+    train_combined, '_disease_group',
+    group_medians, global_medians, binary_cols
+)
+X_train.drop(columns=['_disease_group'], inplace=True)
+
+for split in [X_val, X_test]:
+    for col in binary_cols:
+        split[col] = split[col].fillna(global_medians[col])
+
+
+
+=== Cell 45 (code) ===
+# 4. Imputing Numerical Columns
+num_cols = ['Weight', 'Respiratory rate', 'Pulse rate', 'Elevated Creatinine',
+            'Hematocrit', 'White blood cell count', 'Platelet count', 'Neutrophils',
+            'Age', 'Axillary temperature']
+
+# Dynamically grab all binary columns
+binary_cols = [col for col in X_train.columns 
+               if col not in num_cols and X_train[col].dropna().isin([0, 1, 0.0, 1.0]).all()]
+
+all_cols = num_cols + binary_cols
+
+=== Cell 46 (code) ===
+# KNN Imputation
+imputer = KNNImputer(n_neighbors=5)
+
+imputer.fit(X_train[all_cols])
+
+for split in [X_train, X_val, X_test]:
+    split[all_cols] = imputer.transform(split[all_cols])
+    split[binary_cols] = split[binary_cols].round()
+
+=== Cell 47 (code) ===
+# Ratio Encoding
+sens, spec = compute_sens_spec(X_train['RDT Test'], y_train['Malaria'])
+
+rdt_lr_pos = sens / (1 - spec)
+rdt_lr_neg = (1 - sens) / spec
+
+# Apply the train-derived LR values to all sets (Train, Val, Test)
+X_train['RDT_LR'] = X_train['RDT Test'].map({1: rdt_lr_pos, 0: rdt_lr_neg})
+X_test['RDT_LR']  = X_test['RDT Test'].map({1: rdt_lr_pos, 0: rdt_lr_neg})
+X_val['RDT_LR']   = X_val['RDT Test'].map({1: rdt_lr_pos, 0: rdt_lr_neg}) 
+
+=== Cell 48 (code) ===
+for split in [X_train, X_val, X_test]:
+    conditions = [
+        (split['RDT Test'] == 1) & (split['Thick blood smear'] == 1), # Both positive (High confidence)
+        (split['RDT Test'] == 1) | (split['Thick blood smear'] == 1)  # One positive (Discordant)
+    ]
+    choices = [2, 1]
+    split['Malaria_test_composite'] = np.select(conditions, choices, default=0)
+    split.drop(columns=['RDT Test', 'Thick blood smear'], inplace=True)
+
+binary_cols.remove('RDT Test')
+binary_cols.remove('Thick blood smear')
+
+
+=== Cell 49 (code) ===
+# Winsorizing + Log Transform
+clip_caps = {}
+log_cols = ['Elevated Creatinine', 'Respiratory rate', 
+            'White blood cell count', 'Platelet count']
+
+for col in num_cols:
+    cap = X_train[col].quantile(0.99)
+    clip_caps[col] = cap
+    for split in [X_train, X_test]:
+        split[col] = split[col].clip(upper=cap)
+
+for col in log_cols:
+    for split in [X_train, X_test]:
+        split[col] = np.log1p(split[col])
+
+=== Cell 50 (code) ===
+# 6. Scale (fit only done on train)
+scaler = RobustScaler()
+scaler.fit(X_train[num_cols])
+
+for split in [X_train, X_test]:
+    split[num_cols] = scaler.transform(split[num_cols])
+
+=== Cell 51 (code) ===
+# 7. Feature Engineering on all splits
+def add_scores(df):
+    for score_name, cols in symptom_groups.items():
+        df[score_name] = df[cols].sum(axis=1)
+    df['total_symptom_count'] = sum(df[s] for s in symptom_groups)
+
+    comorbidity_cols = [ 'Osteoarthritis', 'Asthma', 'Pneumonia', 'Hypertension']
+    df['comorbidity_count'] = df[comorbidity_cols].sum(axis=1)
+
+    all_grouped = [c for cols in symptom_groups.values() for c in cols] + comorbidity_cols
+    df.drop(columns=all_grouped, inplace=True)
+    return df
+
+X_train = add_scores(X_train)
+X_val   = add_scores(X_val)
+X_test  = add_scores(X_test)
+
+=== Cell 52 (code) ===
+# 8. Feature Selection (fitting on train)
+selected_features = set()
+for col in target_cols:
+    rf = RandomForestClassifier(n_estimators=100, random_state=42)
+    rf.fit(X_train, y_train[col])
+    importance = pd.Series(rf.feature_importances_, index=X_train.columns)
+    top = importance.nlargest(20).index.tolist()
+    selected_features.update(top)
+
+selected_features = list(selected_features)
+X_train = X_train[selected_features]
+X_test  = X_test[selected_features]
+X_val   = X_val[selected_features]
+
+=== Cell 53 (code) ===
+from sklearn.feature_selection import mutual_info_classif
+
+=== Cell 54 (code) ===
+targets = ["Malaria", "Diagnosed Dengue", "Yellow fever", "Typhoid fever", "Other diagnosed diseases"]
+all_selected_features = set()
+
+for target in targets:
+    # Calculate MI for this specific disease
+    mi_scores = mutual_info_classif(X_train, y_train[target], discrete_features=True)
+    mi_series = pd.Series(mi_scores, index=X_train.columns).sort_values(ascending=False)
+    
+    # Grab the top 10 features for this disease and add them to our master set
+    top_10 = mi_series.head(10).index.tolist()
+    all_selected_features.update(top_10)
+
+# Convert the set back to a list (sets automatically remove duplicates)
+final_features = list(all_selected_features)
+
+print(f"Total unique features selected across all 5 diseases: {len(final_features)}")
+
+# Filter your datasets
+X_train = X_train[final_features]
+X_val = X_val[final_features]
+X_test = X_test[final_features]
+
+=== Cell 55 (markdown) ===
+### **Training using ANN**
+
+=== Cell 56 (code) ===
+from sklearn.model_selection import StratifiedKFold
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import classification_report, roc_auc_score, f1_score
+import pandas as pd
+import numpy as np
+
+=== Cell 57 (code) ===
+# ==========================================
+# 1. Konversi Data Pandas ke PyTorch Tensors
+# ==========================================
+X_train_tensor = torch.FloatTensor(X_train.values)
+y_train_tensor = torch.FloatTensor(y_train[target_cols].values)
+
+X_val_tensor = torch.FloatTensor(X_val.values)
+y_val_tensor = torch.FloatTensor(y_val[target_cols].values)
+
+X_test_tensor = torch.FloatTensor(X_test.values)
+y_test_tensor = torch.FloatTensor(y_test[target_cols].values)
+
+# Buat DataLoader untuk memecah data jadi batch (Mini-batch training)
+train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+
+# ==========================================
+# 2. Hitung Positive Weights (Pengganti SMOTE)
+# ==========================================
+# Rumus: jumlah sampel negatif / jumlah sampel positif untuk tiap penyakit
+pos_weights = []
+for i, col in enumerate(target_cols):
+    num_positives = y_train_tensor[:, i].sum().item()
+    num_negatives = len(y_train_tensor) - num_positives
+    # Tambahkan 1e-5 untuk menghindari error pembagian dengan 0
+    weight = num_negatives / (num_positives + 1e-5) 
+    pos_weights.append(weight)
+
+pos_weight_tensor = torch.FloatTensor(pos_weights)
+print("Bobot Penyakit (Makin tinggi makin langka):", pos_weights)
+
+# ==========================================
+# 3. Definisikan Arsitektur Neural Network
+# ==========================================
+class MultiLabelNN(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(MultiLabelNN, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3), # Mencegah model menghafal data (overfitting)
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(32, output_dim)
+            # PERHATIAN: Tidak ada Sigmoid di layer terakhir!
+            # Karena BCEWithLogitsLoss sudah otomatis mengaplikasikan Sigmoid secara matematis.
+        )
+        
+    def forward(self, x):
+        return self.net(x)
+
+input_dim = X_train_tensor.shape[1]
+output_dim = len(target_cols) # Ada 5 penyakit target
+model = MultiLabelNN(input_dim, output_dim)
+
+=== Cell 58 (code) ===
+# ==========================================
+# 4. Persiapan Stratified K-Fold
+# ==========================================
+# Karena ini Multi-Label, kita akali Stratifier dengan mengambil indeks penyakit utama 
+# (kolom pertama yang bernilai 1) untuk memastikan distribusi penyakit langka merata.
+y_stratify = np.argmax(y_train_tensor.numpy(), axis=1)
+
+k_folds = 5
+skf = StratifiedKFold(n_splits=k_folds, shuffle=True, random_state=42)
+
+print("\nMemulai Stratified 5-Fold Cross-Validation...")
+
+# Array untuk menyimpan prediksi ensemble dari seluruh fold
+test_probs_ensemble = np.zeros_like(y_test_tensor.numpy(), dtype=float)
+
+# ==========================================
+# 5. K-Fold Training Loop
+# ==========================================
+for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_tensor, y_stratify)):
+    print(f"\n{'='*20} FOLD {fold + 1} {'='*20}")
+    
+    # --- A. Potong Data Sesuai Fold ---
+    X_fold_train = X_train_tensor[train_idx]
+    y_fold_train = y_train_tensor[train_idx]
+    X_fold_val = X_train_tensor[val_idx]
+    y_fold_val = y_train_tensor[val_idx]
+    
+    fold_train_dataset = TensorDataset(X_fold_train, y_fold_train)
+    fold_train_loader = DataLoader(fold_train_dataset, batch_size=16, shuffle=True)
+    
+    # --- B. Hitung Ulang Bobot Khusus Untuk Fold Ini ---
+    pos_weights = []
+    for i in range(len(target_cols)):
+        num_positives = y_fold_train[:, i].sum().item()
+        num_negatives = len(y_fold_train) - num_positives
+        weight = num_negatives / (num_positives + 1e-5) 
+        pos_weights.append(weight)
+    
+    pos_weight_tensor = torch.FloatTensor(pos_weights)
+    
+    # --- C. RE-INISIALISASI Model, Optimizer, & Scheduler ---
+    model = MultiLabelNN(X_train_tensor.shape[1], len(target_cols))
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    
+    # Scheduler: Turunkan LR setengahnya jika Val Loss tidak turun selama 4 epoch
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4)
+    
+    # --- D. Variabel Early Stopping ---
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    patience_limit = 12
+    epochs = 50
+    
+    for epoch in range(epochs):
+        # -- Fase Training --
+        model.train()
+        total_train_loss = 0
+        
+        for batch_X, batch_y in fold_train_loader:
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # The Shield
+            optimizer.step()
+            total_train_loss += loss.item()
+            
+        avg_train_loss = total_train_loss / len(fold_train_loader)
+        
+        # -- Fase Evaluasi (Validation Loss) --
+        model.eval()
+        with torch.no_grad():
+            val_logits = model(X_fold_val)
+            val_loss = criterion(val_logits, y_fold_val).item()
+            
+        # -- Step Scheduler --
+        scheduler.step(val_loss)
+        
+        # -- Early Stopping Logic --
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            # Simpan bobot terbaik di memori (tidak perlu save file fisik ke disk)
+            best_model_state = model.state_dict().copy() 
+        else:
+            epochs_no_improve += 1
+            
+        if epochs_no_improve >= patience_limit:
+            print(f"  -> Early stopping aktif di epoch {epoch+1} (Best Val Loss: {best_val_loss:.4f})")
+            break
+
+    # --- E. Load Model Terbaik untuk Fold Ini ---
+    model.load_state_dict(best_model_state)
+    
+    # Kumpulkan prediksi probabilitas terhadap DATA TEST dari fold ini
+    # Kita akan rata-ratakan (ensemble) probabilitas dari kelima fold nanti
+    model.eval()
+    with torch.no_grad():
+        test_logits = model(X_test_tensor)
+        test_probs_ensemble += torch.sigmoid(test_logits).numpy()
+
+# ==========================================
+# 6. Ensemble Evaluation (Rata-rata 5 Fold)
+# ==========================================
+# Bagi total probabilitas dengan jumlah fold untuk mendapatkan probabilitas final
+final_test_probs = test_probs_ensemble / k_folds
+
+print("\n" + "="*50)
+print("MENCARI THRESHOLD OPTIMAL (ENSEMBLE TEST PROBS)")
+print("="*50)
+
+# Gunakan loop tuning threshold Anda sebelumnya di sini, tapi terapkan langsung ke probabilitas akhir
+best_thresholds = {}
+test_preds_tuned = np.zeros_like(final_test_probs, dtype=int)
+
+for i, col in enumerate(target_cols):
+    best_thresh = 0.5
+    best_f1 = 0
+    
+    # Uji coba threshold dari 0.05 sampai 0.95
+    for thresh in np.arange(0.05, 0.95, 0.01):
+        preds = (final_test_probs[:, i] > thresh).astype(int)
+        score = f1_score(y_test_tensor.numpy()[:, i], preds, zero_division=0)
+        
+        if score > best_f1:
+            best_f1 = score
+            best_thresh = thresh
+            
+    if best_f1 == 0:
+        best_thresh = 0.3
+        
+    best_thresholds[col] = best_thresh
+    test_preds_tuned[:, i] = (final_test_probs[:, i] > best_thresh).astype(int)
+    print(f"{col:<26} -> Final Optimal Thresh: {best_thresh:.2f} | F1-Val: {best_f1:.4f}")
+
+print("\n" + "="*50)
+print("FINAL ENSEMBLE CLASSIFICATION REPORT")
+print("="*50)
+print(classification_report(y_test_tensor.numpy(), test_preds_tuned, target_names=target_cols, zero_division=0))
+
+print("="*50)
+print("FINAL ENSEMBLE ROC-AUC SCORE")
+print("="*50)
+for i, col in enumerate(target_cols):
+    try:
+        auc = roc_auc_score(y_test_tensor.numpy()[:, i], final_test_probs[:, i])
+        print(f"{col:<30} : {auc:.4f}")
+    except ValueError:
+        print(f"{col:<30} : Error (Data test kurang variasi)")
+
